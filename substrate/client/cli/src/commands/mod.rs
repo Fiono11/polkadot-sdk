@@ -25,6 +25,8 @@ mod export_blocks_cmd;
 mod export_state_cmd;
 mod generate;
 mod generate_node_key;
+mod generate_threshold_round1;
+mod generate_threshold_round2;
 mod import_blocks_cmd;
 mod insert_key;
 mod inspect_key;
@@ -34,6 +36,9 @@ mod purge_chain_cmd;
 mod revert_cmd;
 mod run_cmd;
 mod sign;
+mod sign_threshold_aggregate;
+mod sign_threshold_round1;
+mod sign_threshold_round2;
 mod test;
 pub mod utils;
 mod vanity;
@@ -42,8 +47,11 @@ mod verify;
 pub use self::{
 	build_spec_cmd::BuildSpecCmd, chain_info_cmd::ChainInfoCmd, check_block_cmd::CheckBlockCmd,
 	export_blocks_cmd::ExportBlocksCmd, export_state_cmd::ExportStateCmd, generate::GenerateCmd,
-	generate_node_key::GenerateKeyCmdCommon, import_blocks_cmd::ImportBlocksCmd,
+	generate_node_key::GenerateKeyCmdCommon, generate_threshold_round1::GenerateThresholdRound1Cmd,
+	generate_threshold_round2::GenerateThresholdRound2Cmd, import_blocks_cmd::ImportBlocksCmd,
 	insert_key::InsertKeyCmd, inspect_key::InspectKeyCmd, inspect_node_key::InspectNodeKeyCmd,
 	key::KeySubcommand, purge_chain_cmd::PurgeChainCmd, revert_cmd::RevertCmd, run_cmd::RunCmd,
-	sign::SignCmd, vanity::VanityCmd, verify::VerifyCmd,
+	sign::SignCmd, sign_threshold_aggregate::SignThresholdAggregateCmd,
+	sign_threshold_round1::SignThresholdRound1Cmd, sign_threshold_round2::SignThresholdRound2Cmd,
+	vanity::VanityCmd, verify::VerifyCmd,
 };

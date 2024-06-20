@@ -34,7 +34,11 @@ serde_json = { workspace = true, default-features = true }
 thiserror = { workspace = true }
 # personal fork here as workaround for: https://github.com/rust-bitcoin/rust-bip39/pull/64
 bip39 = { package = "parity-bip39", version = "2.0.1", features = ["rand"] }
-tokio = { version = "1.22.0", features = ["parking_lot", "rt-multi-thread", "signal"] }
+tokio = { version = "1.22.0", features = [
+    "parking_lot",
+    "rt-multi-thread",
+    "signal",
+] }
 sc-client-api = { path = "../api" }
 sc-client-db = { path = "../db", default-features = false }
 sc-keystore = { path = "../keystore" }
@@ -51,6 +55,15 @@ sp-keystore = { path = "../../primitives/keystore" }
 sp-panic-handler = { path = "../../primitives/panic-handler" }
 sp-runtime = { path = "../../primitives/runtime" }
 sp-version = { path = "../../primitives/version" }
+schnorrkel = { git = "https://github.com/Fiono11/schnorrkel", branch = "final_frost", features = [
+    "alloc",
+    "aead",
+] }
+hex = "0.4.3"
+subxt = "0.37.0"
+color-eyre = "0.6.3"
+scale-value = { version = "0.16.0", default-features = false }
+subxt-signer = { version = "0.36.0", features = ["sr25519"] }
 
 [dev-dependencies]
 tempfile = "3.1.0"

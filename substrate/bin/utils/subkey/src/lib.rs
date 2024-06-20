@@ -310,7 +310,9 @@
 
 use clap::Parser;
 use sc_cli::{
-	Error, GenerateCmd, GenerateKeyCmdCommon, InspectKeyCmd, InspectNodeKeyCmd, SignCmd, VanityCmd,
+	Error, GenerateCmd, GenerateKeyCmdCommon, GenerateThresholdRound1Cmd,
+	GenerateThresholdRound2Cmd, InspectKeyCmd, InspectNodeKeyCmd, SignCmd,
+	SignThresholdAggregateCmd, SignThresholdRound1Cmd, SignThresholdRound2Cmd, VanityCmd,
 	VerifyCmd,
 };
 
@@ -329,6 +331,21 @@ pub enum Subkey {
 	/// Generate a random account
 	Generate(GenerateCmd),
 
+	/// Round 1 of generating a threshold account
+	GenerateThresholdRound1(GenerateThresholdRound1Cmd),
+
+	/// Round 2 of generating a threshold account
+	GenerateThresholdRound2(GenerateThresholdRound2Cmd),
+
+	/// Round 1 of signing with a threshold account
+	SignThresholdRound1(SignThresholdRound1Cmd),
+
+	/// Round 2 of signing with a threshold account
+	SignThresholdRound2(SignThresholdRound2Cmd),
+
+	/// Aggregate the partial signatures to form a threshold signature of a threshold account
+	SignThresholdAggregate(SignThresholdAggregateCmd),
+
 	/// Gets a public key and a SS58 address from the provided Secret URI
 	Inspect(InspectKeyCmd),
 
@@ -346,10 +363,15 @@ pub enum Subkey {
 }
 
 /// Run the subkey command, given the appropriate runtime.
-pub fn run() -> Result<(), Error> {
+pub async fn run() -> Result<(), Error> {
 	match Subkey::parse() {
 		Subkey::GenerateNodeKey(cmd) => cmd.run(),
 		Subkey::Generate(cmd) => cmd.run(),
+		Subkey::GenerateThresholdRound1(cmd) => cmd.run(),
+		Subkey::GenerateThresholdRound2(cmd) => cmd.run(),
+		Subkey::SignThresholdRound1(cmd) => cmd.run(),
+		Subkey::SignThresholdRound2(cmd) => cmd.run().await,
+		Subkey::SignThresholdAggregate(cmd) => cmd.run().await,
 		Subkey::Inspect(cmd) => cmd.run(),
 		Subkey::InspectNodeKey(cmd) => cmd.run(),
 		Subkey::Vanity(cmd) => cmd.run(),

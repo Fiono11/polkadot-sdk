@@ -18,6 +18,7 @@
 
 //! Subkey utility, based on kitchensink_runtime.
 
-fn main() -> Result<(), sc_cli::Error> {
-	subkey::run()
+#[tokio::main]
+async fn main() -> Result<(), sc_cli::Error> {
+	subkey::run().await
 }
