@@ -17,11 +17,11 @@
 
 use super::*;
 use frame_support::{
-	pallet_prelude::{DispatchResult, *},
+	pallet_prelude::*,
 	traits::{fungible::Mutate, tokens::Preservation::Expendable, DefensiveResult},
 };
 use sp_arithmetic::traits::{CheckedDiv, Saturating, Zero};
-use sp_runtime::traits::Convert;
+use sp_runtime::traits::{BlockNumberProvider, Convert};
 use CompletionStatus::{Complete, Partial};
 
 impl<T: Config> Pallet<T> {
@@ -91,7 +91,7 @@ impl<T: Config> Pallet<T> {
 			last_committed_timeslice: commit_timeslice.saturating_sub(1),
 			last_timeslice: Self::current_timeslice(),
 		};
-		let now = frame_system::Pallet::<T>::block_number();
+		let now = RCBlockNumberProviderOf::<T::Coretime>::current_block_number();
 		// Imaginary old sale for bootstrapping the first actual sale:
 		let old_sale = SaleInfoRecord {
 			sale_start: now,
@@ -119,7 +119,7 @@ impl<T: Config> Pallet<T> {
 		let mut sale = SaleInfo::<T>::get().ok_or(Error::<T>::NoSales)?;
 		Self::ensure_cores_for_sale(&status, &sale)?;
 
-		let now = frame_system::Pallet::<T>::block_number();
+		let now = RCBlockNumberProviderOf::<T::Coretime>::current_block_number();
 		ensure!(now > sale.sale_start, Error::<T>::TooEarly);
 		let price = Self::sale_price(&sale, now);
 		ensure!(price_limit >= price, Error::<T>::Overpriced);
@@ -127,8 +127,14 @@ impl<T: Config> Pallet<T> {
 		let core = Self::purchase_core(&who, price, &mut sale)?;
 
 		SaleInfo::<T>::put(&sale);
-		let id =
-			Self::issue(core, sale.region_begin, sale.region_end, Some(who.clone()), Some(price));
+		let id = Self::issue(
+			core,
+			sale.region_begin,
+			CoreMask::complete(),
+			sale.region_end,
+			Some(who.clone()),
+			Some(price),
+		);
 		let duration = sale.region_end.saturating_sub(sale.region_begin);
 		Self::deposit_event(Event::Purchased { who, region_id: id, price, duration });
 		Ok(id)
@@ -165,7 +171,7 @@ impl<T: Config> Pallet<T> {
 
 		let begin = sale.region_end;
 		let price_cap = record.price + config.renewal_bump * record.price;
-		let now = frame_system::Pallet::<T>::block_number();
+		let now = RCBlockNumberProviderOf::<T::Coretime>::current_block_number();
 		let price = Self::sale_price(&sale, now).min(price_cap);
 		log::debug!(
 			"Renew with: sale price: {:?}, price cap: {:?}, old price: {:?}",
@@ -458,6 +464,11 @@ impl<T: Config> Pallet<T> {
 		Ok(())
 	}
 
+	pub(crate) fn do_notify_revenue(revenue: OnDemandRevenueRecordOf<T>) -> DispatchResult {
+		RevenueInbox::<T>::put(revenue);
+		Ok(())
+	}
+
 	pub(crate) fn do_swap_leases(id: TaskId, other: TaskId) -> DispatchResult {
 		let mut id_leases_count = 0;
 		let mut other_leases_count = 0;
@@ -472,7 +483,72 @@ impl<T: Config> Pallet<T> {
 				}
 			})
 		});
+		Ok(())
+	}
 
+	pub(crate) fn do_enable_auto_renew(
+		sovereign_account: T::AccountId,
+		core: CoreIndex,
+		task: TaskId,
+		workload_end_hint: Option<Timeslice>,
+	) -> DispatchResult {
+		let sale = SaleInfo::<T>::get().ok_or(Error::<T>::NoSales)?;
+
+		// Check if the core is expiring in the next bulk period; if so, we will renew it now.
+		//
+		// In case we renew it now, we don't need to check the workload end since we know it is
+		// eligible for renewal.
+		if PotentialRenewals::<T>::get(PotentialRenewalId { core, when: sale.region_begin })
+			.is_some()
+		{
+			Self::do_renew(sovereign_account.clone(), core)?;
+		} else if let Some(workload_end) = workload_end_hint {
+			ensure!(
+				PotentialRenewals::<T>::get(PotentialRenewalId { core, when: workload_end })
+					.is_some(),
+				Error::<T>::NotAllowed
+			);
+		} else {
+			return Err(Error::<T>::NotAllowed.into())
+		}
+
+		// We are sorting auto renewals by `CoreIndex`.
+		AutoRenewals::<T>::try_mutate(|renewals| {
+			let pos = renewals
+				.binary_search_by(|r: &AutoRenewalRecord| r.core.cmp(&core))
+				.unwrap_or_else(|e| e);
+			renewals.try_insert(
+				pos,
+				AutoRenewalRecord {
+					core,
+					task,
+					next_renewal: workload_end_hint.unwrap_or(sale.region_end),
+				},
+			)
+		})
+		.map_err(|_| Error::<T>::TooManyAutoRenewals)?;
+
+		Self::deposit_event(Event::AutoRenewalEnabled { core, task });
+		Ok(())
+	}
+
+	pub(crate) fn do_disable_auto_renew(core: CoreIndex, task: TaskId) -> DispatchResult {
+		AutoRenewals::<T>::try_mutate(|renewals| -> DispatchResult {
+			let pos = renewals
+				.binary_search_by(|r: &AutoRenewalRecord| r.core.cmp(&core))
+				.map_err(|_| Error::<T>::AutoRenewalNotEnabled)?;
+
+			let renewal_record = renewals.get(pos).ok_or(Error::<T>::AutoRenewalNotEnabled)?;
+
+			ensure!(
+				renewal_record.core == core && renewal_record.task == task,
+				Error::<T>::NoPermission
+			);
+			renewals.remove(pos);
+			Ok(())
+		})?;
+
+		Self::deposit_event(Event::AutoRenewalDisabled { core, task });
 		Ok(())
 	}
 
@@ -493,7 +569,7 @@ impl<T: Config> Pallet<T> {
 
 		Self::ensure_cores_for_sale(&status, &sale)?;
 
-		let now = frame_system::Pallet::<T>::block_number();
+		let now = RCBlockNumberProviderOf::<T::Coretime>::current_block_number();
 		Ok(Self::sale_price(&sale, now))
 	}
 }

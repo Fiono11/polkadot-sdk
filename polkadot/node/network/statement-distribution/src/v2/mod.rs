@@ -45,13 +45,17 @@ use polkadot_node_subsystem::{
 use polkadot_node_subsystem_util::{
 	backing_implicit_view::View as ImplicitView,
 	reputation::ReputationAggregator,
-	runtime::{request_min_backing_votes, ProspectiveParachainsMode},
-	vstaging::{fetch_claim_queue, ClaimQueueSnapshot},
+	runtime::{
+		request_min_backing_votes, request_node_features, ClaimQueueSnapshot,
+		ProspectiveParachainsMode,
+	},
 };
 use polkadot_primitives::{
-	AuthorityDiscoveryId, CandidateHash, CompactStatement, CoreIndex, CoreState, GroupIndex,
-	GroupRotationInfo, Hash, Id as ParaId, IndexedVec, SessionIndex, SessionInfo, SignedStatement,
-	SigningContext, UncheckedSignedStatement, ValidatorId, ValidatorIndex,
+	node_features::FeatureIndex,
+	vstaging::{transpose_claim_queue, CandidateDescriptorVersion, TransposedClaimQueue},
+	AuthorityDiscoveryId, CandidateHash, CompactStatement, CoreIndex, GroupIndex,
+	GroupRotationInfo, Hash, Id as ParaId, IndexedVec, NodeFeatures, SessionIndex, SessionInfo,
+	SignedStatement, SigningContext, UncheckedSignedStatement, ValidatorId, ValidatorIndex,
 };
 
 use sp_keystore::KeystorePtr;
@@ -136,6 +140,12 @@ const COST_UNREQUESTED_RESPONSE_STATEMENT: Rep =
 	Rep::CostMajor("Un-requested Statement In Response");
 const COST_INACCURATE_ADVERTISEMENT: Rep =
 	Rep::CostMajor("Peer advertised a candidate inaccurately");
+const COST_UNSUPPORTED_DESCRIPTOR_VERSION: Rep =
+	Rep::CostMajor("Candidate Descriptor version is not supported");
+const COST_INVALID_CORE_INDEX: Rep =
+	Rep::CostMajor("Candidate Descriptor contains an invalid core index");
+const COST_INVALID_SESSION_INDEX: Rep =
+	Rep::CostMajor("Candidate Descriptor contains an invalid session index");
 
 const COST_INVALID_REQUEST: Rep = Rep::CostMajor("Peer sent unparsable request");
 const COST_INVALID_REQUEST_BITFIELD_SIZE: Rep =
@@ -155,6 +165,7 @@ struct PerRelayParentState {
 	statement_store: StatementStore,
 	seconding_limit: usize,
 	session: SessionIndex,
+	transposed_cq: TransposedClaimQueue,
 	groups_per_para: HashMap<ParaId, Vec<GroupIndex>>,
 	disabled_validators: HashSet<ValidatorIndex>,
 }
@@ -218,10 +229,17 @@ struct PerSessionState {
 	// getting the topology from the gossip-support subsystem
 	grid_view: Option<grid::SessionTopologyView>,
 	local_validator: Option<LocalValidatorIndex>,
+	// `true` if v2 candidate receipts are allowed by the runtime
+	allow_v2_descriptors: bool,
 }
 
 impl PerSessionState {
-	fn new(session_info: SessionInfo, keystore: &KeystorePtr, backing_threshold: u32) -> Self {
+	fn new(
+		session_info: SessionInfo,
+		keystore: &KeystorePtr,
+		backing_threshold: u32,
+		allow_v2_descriptors: bool,
+	) -> Self {
 		let groups = Groups::new(session_info.validator_groups.clone(), backing_threshold);
 		let mut authority_lookup = HashMap::new();
 		for (i, ad) in session_info.discovery_keys.iter().cloned().enumerate() {
@@ -234,7 +252,14 @@ impl PerSessionState {
 		)
 		.map(|(_, index)| LocalValidatorIndex::Active(index));
 
-		PerSessionState { session_info, groups, authority_lookup, grid_view: None, local_validator }
+		PerSessionState {
+			session_info,
+			groups,
+			authority_lookup,
+			grid_view: None,
+			local_validator,
+			allow_v2_descriptors,
+		}
 	}
 
 	fn supply_topology(
@@ -269,6 +294,11 @@ impl PerSessionState {
 	/// `false` is also returned if session topology is not known yet.
 	fn is_not_validator(&self) -> bool {
 		self.grid_view.is_some() && self.local_validator.is_none()
+	}
+
+	/// Returns `true` if v2 candidate receipts are enabled
+	fn candidate_receipt_v2_enabled(&self) -> bool {
+		self.allow_v2_descriptors
 	}
 }
 
@@ -400,6 +430,7 @@ pub(crate) async fn handle_network_update<Context>(
 	state: &mut State,
 	update: NetworkBridgeEvent<net_protocol::StatementDistributionMessage>,
 	reputation: &mut ReputationAggregator,
+	metrics: &Metrics,
 ) {
 	match update {
 		NetworkBridgeEvent::PeerConnected(peer_id, role, protocol_version, mut authority_ids) => {
@@ -483,23 +514,33 @@ pub(crate) async fn handle_network_update<Context>(
 			net_protocol::StatementDistributionMessage::V3(
 				protocol_v3::StatementDistributionMessage::Statement(relay_parent, statement),
 			) =>
-				handle_incoming_statement(ctx, state, peer_id, relay_parent, statement, reputation)
-					.await,
+				handle_incoming_statement(
+					ctx,
+					state,
+					peer_id,
+					relay_parent,
+					statement,
+					reputation,
+					metrics,
+				)
+				.await,
 			net_protocol::StatementDistributionMessage::V2(
 				protocol_v2::StatementDistributionMessage::BackedCandidateManifest(inner),
 			) |
 			net_protocol::StatementDistributionMessage::V3(
 				protocol_v3::StatementDistributionMessage::BackedCandidateManifest(inner),
-			) => handle_incoming_manifest(ctx, state, peer_id, inner, reputation).await,
+			) => handle_incoming_manifest(ctx, state, peer_id, inner, reputation, metrics).await,
 			net_protocol::StatementDistributionMessage::V2(
 				protocol_v2::StatementDistributionMessage::BackedCandidateKnown(inner),
 			) |
 			net_protocol::StatementDistributionMessage::V3(
 				protocol_v3::StatementDistributionMessage::BackedCandidateKnown(inner),
-			) => handle_incoming_acknowledgement(ctx, state, peer_id, inner, reputation).await,
+			) =>
+				handle_incoming_acknowledgement(ctx, state, peer_id, inner, reputation, metrics)
+					.await,
 		},
 		NetworkBridgeEvent::PeerViewChange(peer_id, view) =>
-			handle_peer_view_update(ctx, state, peer_id, view).await,
+			handle_peer_view_update(ctx, state, peer_id, view, metrics).await,
 		NetworkBridgeEvent::OurViewChange(_view) => {
 			// handled by `handle_activated_leaf`
 		},
@@ -539,6 +580,7 @@ pub(crate) async fn handle_active_leaves_update<Context>(
 	state: &mut State,
 	activated: &ActivatedLeaf,
 	leaf_mode: ProspectiveParachainsMode,
+	metrics: &Metrics,
 ) -> JfyiErrorResult<()> {
 	let max_candidate_depth = match leaf_mode {
 		ProspectiveParachainsMode::Disabled => return Ok(()),
@@ -558,7 +600,7 @@ pub(crate) async fn handle_active_leaves_update<Context>(
 
 	for new_relay_parent in new_relay_parents.iter().cloned() {
 		let disabled_validators: HashSet<_> =
-			polkadot_node_subsystem_util::vstaging::get_disabled_validators_with_fallback(
+			polkadot_node_subsystem_util::runtime::get_disabled_validators_with_fallback(
 				ctx.sender(),
 				new_relay_parent,
 			)
@@ -602,8 +644,18 @@ pub(crate) async fn handle_active_leaves_update<Context>(
 
 			let minimum_backing_votes =
 				request_min_backing_votes(new_relay_parent, session_index, ctx.sender()).await?;
-			let mut per_session_state =
-				PerSessionState::new(session_info, &state.keystore, minimum_backing_votes);
+			let node_features =
+				request_node_features(new_relay_parent, session_index, ctx.sender()).await?;
+			let mut per_session_state = PerSessionState::new(
+				session_info,
+				&state.keystore,
+				minimum_backing_votes,
+				node_features
+					.unwrap_or(NodeFeatures::EMPTY)
+					.get(FeatureIndex::CandidateReceiptV2 as usize)
+					.map(|b| *b)
+					.unwrap_or(false),
+			);
 			if let Some(topology) = state.unused_topologies.remove(&session_index) {
 				per_session_state.supply_topology(&topology.topology, topology.local_index);
 			}
@@ -629,18 +681,6 @@ pub(crate) async fn handle_active_leaves_update<Context>(
 			continue
 		}
 
-		// New leaf: fetch info from runtime API and initialize
-		// `per_relay_parent`.
-
-		let availability_cores = polkadot_node_subsystem_util::request_availability_cores(
-			new_relay_parent,
-			ctx.sender(),
-		)
-		.await
-		.await
-		.map_err(JfyiError::RuntimeApiUnavailable)?
-		.map_err(JfyiError::FetchAvailabilityCores)?;
-
 		let group_rotation_info =
 			polkadot_node_subsystem_util::request_validator_groups(new_relay_parent, ctx.sender())
 				.await
@@ -649,23 +689,22 @@ pub(crate) async fn handle_active_leaves_update<Context>(
 				.map_err(JfyiError::FetchValidatorGroups)?
 				.1;
 
-		let maybe_claim_queue = fetch_claim_queue(ctx.sender(), new_relay_parent)
-		.await
-		.unwrap_or_else(|err| {
-				gum::debug!(target: LOG_TARGET, ?new_relay_parent, ?err, "handle_active_leaves_update: `claim_queue` API not available");
-				None
-			});
+		let claim_queue = ClaimQueueSnapshot(
+			polkadot_node_subsystem_util::request_claim_queue(new_relay_parent, ctx.sender())
+				.await
+				.await
+				.map_err(JfyiError::RuntimeApiUnavailable)?
+				.map_err(JfyiError::FetchClaimQueue)?,
+		);
 
 		let local_validator = per_session.local_validator.and_then(|v| {
 			if let LocalValidatorIndex::Active(idx) = v {
 				find_active_validator_state(
 					idx,
 					&per_session.groups,
-					&availability_cores,
 					&group_rotation_info,
-					&maybe_claim_queue,
+					&claim_queue,
 					seconding_limit,
-					max_candidate_depth,
 				)
 			} else {
 				Some(LocalValidatorState { grid_tracker: GridTracker::default(), active: None })
@@ -673,12 +712,13 @@ pub(crate) async fn handle_active_leaves_update<Context>(
 		});
 
 		let groups_per_para = determine_groups_per_para(
-			availability_cores,
+			per_session.groups.all().len(),
 			group_rotation_info,
-			&maybe_claim_queue,
-			max_candidate_depth,
+			&claim_queue,
 		)
 		.await;
+
+		let transposed_cq = transpose_claim_queue(claim_queue.0);
 
 		state.per_relay_parent.insert(
 			new_relay_parent,
@@ -689,6 +729,7 @@ pub(crate) async fn handle_active_leaves_update<Context>(
 				session: session_index,
 				groups_per_para,
 				disabled_validators,
+				transposed_cq,
 			},
 		);
 	}
@@ -714,7 +755,8 @@ pub(crate) async fn handle_active_leaves_update<Context>(
 
 		for (peer, fresh) in update_peers {
 			for fresh_relay_parent in fresh {
-				send_peer_messages_for_relay_parent(ctx, state, peer, fresh_relay_parent).await;
+				send_peer_messages_for_relay_parent(ctx, state, peer, fresh_relay_parent, metrics)
+					.await;
 			}
 		}
 	}
@@ -727,11 +769,9 @@ pub(crate) async fn handle_active_leaves_update<Context>(
 fn find_active_validator_state(
 	validator_index: ValidatorIndex,
 	groups: &Groups,
-	availability_cores: &[CoreState],
 	group_rotation_info: &GroupRotationInfo,
-	maybe_claim_queue: &Option<ClaimQueueSnapshot>,
+	claim_queue: &ClaimQueueSnapshot,
 	seconding_limit: usize,
-	max_candidate_depth: usize,
 ) -> Option<LocalValidatorState> {
 	if groups.all().is_empty() {
 		return None
@@ -739,23 +779,8 @@ fn find_active_validator_state(
 
 	let our_group = groups.by_validator_index(validator_index)?;
 
-	let core_index = group_rotation_info.core_for_group(our_group, availability_cores.len());
-	let paras_assigned_to_core = if let Some(claim_queue) = maybe_claim_queue {
-		claim_queue.iter_claims_for_core(&core_index).copied().collect()
-	} else {
-		availability_cores
-			.get(core_index.0 as usize)
-			.and_then(|core_state| match core_state {
-				CoreState::Scheduled(scheduled_core) => Some(scheduled_core.para_id),
-				CoreState::Occupied(occupied_core) if max_candidate_depth >= 1 => occupied_core
-					.next_up_on_available
-					.as_ref()
-					.map(|scheduled_core| scheduled_core.para_id),
-				CoreState::Free | CoreState::Occupied(_) => None,
-			})
-			.into_iter()
-			.collect()
-	};
+	let core_index = group_rotation_info.core_for_group(our_group, groups.all().len());
+	let paras_assigned_to_core = claim_queue.iter_claims_for_core(&core_index).copied().collect();
 	let group_validators = groups.get(our_group)?.to_owned();
 
 	Some(LocalValidatorState {
@@ -815,6 +840,7 @@ async fn handle_peer_view_update<Context>(
 	state: &mut State,
 	peer: PeerId,
 	new_view: View,
+	metrics: &Metrics,
 ) {
 	let fresh_implicit = {
 		let peer_data = match state.peers.get_mut(&peer) {
@@ -826,7 +852,7 @@ async fn handle_peer_view_update<Context>(
 	};
 
 	for new_relay_parent in fresh_implicit {
-		send_peer_messages_for_relay_parent(ctx, state, peer, new_relay_parent).await;
+		send_peer_messages_for_relay_parent(ctx, state, peer, new_relay_parent, metrics).await;
 	}
 }
 
@@ -857,6 +883,7 @@ async fn send_peer_messages_for_relay_parent<Context>(
 	state: &mut State,
 	peer: PeerId,
 	relay_parent: Hash,
+	metrics: &Metrics,
 ) {
 	let peer_data = match state.peers.get_mut(&peer) {
 		None => return,
@@ -889,6 +916,7 @@ async fn send_peer_messages_for_relay_parent<Context>(
 				&mut active.cluster_tracker,
 				&state.candidates,
 				&relay_parent_state.statement_store,
+				metrics,
 			)
 			.await;
 		}
@@ -901,6 +929,7 @@ async fn send_peer_messages_for_relay_parent<Context>(
 			&per_session_state.groups,
 			relay_parent_state,
 			&state.candidates,
+			metrics,
 		)
 		.await;
 	}
@@ -949,6 +978,7 @@ async fn send_pending_cluster_statements<Context>(
 	cluster_tracker: &mut ClusterTracker,
 	candidates: &Candidates,
 	statement_store: &StatementStore,
+	metrics: &Metrics,
 ) {
 	let pending_statements = cluster_tracker.pending_statements_for(peer_validator_id);
 	let network_messages = pending_statements
@@ -974,12 +1004,12 @@ async fn send_pending_cluster_statements<Context>(
 		})
 		.collect::<Vec<_>>();
 
-	if network_messages.is_empty() {
-		return
+	if !network_messages.is_empty() {
+		let count = network_messages.len();
+		ctx.send_message(NetworkBridgeTxMessage::SendValidationMessages(network_messages))
+			.await;
+		metrics.on_statements_distributed(count);
 	}
-
-	ctx.send_message(NetworkBridgeTxMessage::SendValidationMessages(network_messages))
-		.await;
 }
 
 /// Send a peer all pending grid messages / acknowledgements / follow up statements
@@ -993,6 +1023,7 @@ async fn send_pending_grid_messages<Context>(
 	groups: &Groups,
 	relay_parent_state: &mut PerRelayParentState,
 	candidates: &Candidates,
+	metrics: &Metrics,
 ) {
 	let pending_manifests = {
 		let local_validator = match relay_parent_state.local_validator.as_mut() {
@@ -1005,6 +1036,7 @@ async fn send_pending_grid_messages<Context>(
 	};
 
 	let mut messages: Vec<(Vec<PeerId>, net_protocol::VersionedValidationProtocol)> = Vec::new();
+	let mut statements_count = 0;
 	for (candidate_hash, kind) in pending_manifests {
 		let confirmed_candidate = match candidates.get_confirmed(&candidate_hash) {
 			None => continue, // sanity
@@ -1079,7 +1111,7 @@ async fn send_pending_grid_messages<Context>(
 				};
 			},
 			grid::ManifestKind::Acknowledgement => {
-				messages.extend(acknowledgement_and_statement_messages(
+				let (m, c) = acknowledgement_and_statement_messages(
 					peer_id,
 					peer_validator_id,
 					groups,
@@ -1088,7 +1120,9 @@ async fn send_pending_grid_messages<Context>(
 					group_index,
 					candidate_hash,
 					local_knowledge,
-				));
+				);
+				messages.extend(m);
+				statements_count += c;
 			},
 		}
 	}
@@ -1107,8 +1141,9 @@ async fn send_pending_grid_messages<Context>(
 
 		let pending_statements = grid_tracker.all_pending_statements_for(peer_validator_id);
 
-		let extra_statements =
-			pending_statements.into_iter().filter_map(|(originator, compact)| {
+		let extra_statements = pending_statements
+			.into_iter()
+			.filter_map(|(originator, compact)| {
 				let res = pending_statement_network_message(
 					&relay_parent_state.statement_store,
 					relay_parent,
@@ -1128,15 +1163,17 @@ async fn send_pending_grid_messages<Context>(
 				}
 
 				res
-			});
+			})
+			.collect::<Vec<_>>();
 
+		statements_count += extra_statements.len();
 		messages.extend(extra_statements);
 	}
 
-	if messages.is_empty() {
-		return
+	if !messages.is_empty() {
+		ctx.send_message(NetworkBridgeTxMessage::SendValidationMessages(messages)).await;
+		metrics.on_statements_distributed(statements_count);
 	}
-	ctx.send_message(NetworkBridgeTxMessage::SendValidationMessages(messages)).await;
 }
 
 // Imports a locally originating statement and distributes it to peers.
@@ -1147,6 +1184,7 @@ pub(crate) async fn share_local_statement<Context>(
 	relay_parent: Hash,
 	statement: SignedFullStatementWithPVD,
 	reputation: &mut ReputationAggregator,
+	metrics: &Metrics,
 ) -> JfyiErrorResult<()> {
 	let per_relay_parent = match state.per_relay_parent.get_mut(&relay_parent) {
 		None => return Err(JfyiError::InvalidShare),
@@ -1174,7 +1212,7 @@ pub(crate) async fn share_local_statement<Context>(
 	// have the candidate. Sanity: check the para-id is valid.
 	let expected = match statement.payload() {
 		FullStatementWithPVD::Seconded(ref c, _) =>
-			Some((c.descriptor().para_id, c.descriptor().relay_parent)),
+			Some((c.descriptor.para_id(), c.descriptor.relay_parent())),
 		FullStatementWithPVD::Valid(hash) =>
 			state.candidates.get_confirmed(&hash).map(|c| (c.para_id(), c.relay_parent())),
 	};
@@ -1269,11 +1307,12 @@ pub(crate) async fn share_local_statement<Context>(
 		&state.authorities,
 		&state.peers,
 		compact_statement,
+		metrics,
 	)
 	.await;
 
 	if let Some(post_confirmation) = post_confirmation {
-		apply_post_confirmation(ctx, state, post_confirmation, reputation).await;
+		apply_post_confirmation(ctx, state, post_confirmation, reputation, metrics).await;
 	}
 
 	Ok(())
@@ -1310,6 +1349,7 @@ async fn circulate_statement<Context>(
 	authorities: &HashMap<AuthorityDiscoveryId, PeerId>,
 	peers: &HashMap<PeerId, PeerState>,
 	statement: SignedStatement,
+	metrics: &Metrics,
 ) {
 	let session_info = &per_session.session_info;
 
@@ -1446,6 +1486,7 @@ async fn circulate_statement<Context>(
 			.into(),
 		))
 		.await;
+		metrics.on_statement_distributed();
 	}
 
 	if !statement_to_v3_peers.is_empty() {
@@ -1465,6 +1506,7 @@ async fn circulate_statement<Context>(
 			.into(),
 		))
 		.await;
+		metrics.on_statement_distributed();
 	}
 }
 /// Check a statement signature under this parent hash.
@@ -1511,6 +1553,7 @@ async fn handle_incoming_statement<Context>(
 	relay_parent: Hash,
 	statement: UncheckedSignedStatement,
 	reputation: &mut ReputationAggregator,
+	metrics: &Metrics,
 ) {
 	let peer_state = match state.peers.get(&peer) {
 		None => {
@@ -1787,6 +1830,7 @@ async fn handle_incoming_statement<Context>(
 			&state.authorities,
 			&state.peers,
 			checked_statement,
+			metrics,
 		)
 		.await;
 	} else {
@@ -1944,6 +1988,7 @@ async fn provide_candidate_to_grid<Context>(
 	per_session: &PerSessionState,
 	authorities: &HashMap<AuthorityDiscoveryId, PeerId>,
 	peers: &HashMap<PeerId, PeerState>,
+	metrics: &Metrics,
 ) {
 	let local_validator = match relay_parent_state.local_validator {
 		Some(ref mut v) => v,
@@ -2131,46 +2176,25 @@ async fn provide_candidate_to_grid<Context>(
 		.await;
 	}
 	if !post_statements.is_empty() {
+		let count = post_statements.len();
 		ctx.send_message(NetworkBridgeTxMessage::SendValidationMessages(post_statements))
 			.await;
+		metrics.on_statements_distributed(count);
 	}
 }
 
 // Utility function to populate per relay parent `ParaId` to `GroupIndex` mappings.
 async fn determine_groups_per_para(
-	availability_cores: Vec<CoreState>,
+	n_cores: usize,
 	group_rotation_info: GroupRotationInfo,
-	maybe_claim_queue: &Option<ClaimQueueSnapshot>,
-	max_candidate_depth: usize,
+	claim_queue: &ClaimQueueSnapshot,
 ) -> HashMap<ParaId, Vec<GroupIndex>> {
-	let n_cores = availability_cores.len();
-
 	// Determine the core indices occupied by each para at the current relay parent. To support
 	// on-demand parachains we also consider the core indices at next blocks.
-	let schedule: HashMap<CoreIndex, Vec<ParaId>> = if let Some(claim_queue) = maybe_claim_queue {
-		claim_queue
-			.iter_all_claims()
-			.map(|(core_index, paras)| (*core_index, paras.iter().copied().collect()))
-			.collect()
-	} else {
-		availability_cores
-			.into_iter()
-			.enumerate()
-			.filter_map(|(index, core)| match core {
-				CoreState::Scheduled(scheduled_core) =>
-					Some((CoreIndex(index as u32), vec![scheduled_core.para_id])),
-				CoreState::Occupied(occupied_core) =>
-					if max_candidate_depth >= 1 {
-						occupied_core.next_up_on_available.map(|scheduled_core| {
-							(CoreIndex(index as u32), vec![scheduled_core.para_id])
-						})
-					} else {
-						None
-					},
-				CoreState::Free => None,
-			})
-			.collect()
-	};
+	let schedule: HashMap<CoreIndex, Vec<ParaId>> = claim_queue
+		.iter_all_claims()
+		.map(|(core_index, paras)| (*core_index, paras.iter().copied().collect()))
+		.collect();
 
 	let mut groups_per_para = HashMap::new();
 	// Map from `CoreIndex` to `GroupIndex` and collect as `HashMap`.
@@ -2202,7 +2226,9 @@ async fn fragment_chain_update_inner<Context>(
 	// 2. find out which are in the frontier
 	gum::debug!(
 		target: LOG_TARGET,
-		"Calling getHypotheticalMembership from statement distribution"
+		active_leaf_hash = ?active_leaf_hash,
+		"Calling getHypotheticalMembership from statement distribution for candidates: {:?}",
+		&hypotheticals.iter().map(|hypo| hypo.candidate_hash()).collect::<Vec<_>>()
 	);
 	let candidate_memberships = {
 		let (tx, rx) = oneshot::channel();
@@ -2239,13 +2265,13 @@ async fn fragment_chain_update_inner<Context>(
 		} = hypo
 		{
 			let confirmed_candidate = state.candidates.get_confirmed(&candidate_hash);
-			let prs = state.per_relay_parent.get_mut(&receipt.descriptor().relay_parent);
+			let prs = state.per_relay_parent.get_mut(&receipt.descriptor.relay_parent());
 			if let (Some(confirmed), Some(prs)) = (confirmed_candidate, prs) {
 				let per_session = state.per_session.get(&prs.session);
 				let group_index = confirmed.group_index();
 
 				// Sanity check if group_index is valid for this para at relay parent.
-				let Some(expected_groups) = prs.groups_per_para.get(&receipt.descriptor().para_id)
+				let Some(expected_groups) = prs.groups_per_para.get(&receipt.descriptor.para_id())
 				else {
 					continue
 				};
@@ -2258,7 +2284,7 @@ async fn fragment_chain_update_inner<Context>(
 						ctx,
 						candidate_hash,
 						confirmed.group_index(),
-						&receipt.descriptor().relay_parent,
+						&receipt.descriptor.relay_parent(),
 						prs,
 						confirmed,
 						per_session,
@@ -2532,6 +2558,7 @@ async fn handle_incoming_manifest<Context>(
 	peer: PeerId,
 	manifest: net_protocol::v2::BackedCandidateManifest,
 	reputation: &mut ReputationAggregator,
+	metrics: &Metrics,
 ) {
 	gum::debug!(
 		target: LOG_TARGET,
@@ -2588,7 +2615,7 @@ async fn handle_incoming_manifest<Context>(
 			)
 		};
 
-		let messages = acknowledgement_and_statement_messages(
+		let (messages, statements_count) = acknowledgement_and_statement_messages(
 			&(
 				peer,
 				state
@@ -2609,6 +2636,7 @@ async fn handle_incoming_manifest<Context>(
 
 		if !messages.is_empty() {
 			ctx.send_message(NetworkBridgeTxMessage::SendValidationMessages(messages)).await;
+			metrics.on_statements_distributed(statements_count);
 		}
 	} else if !state.candidates.is_confirmed(&manifest.candidate_hash) {
 		// 5. if unconfirmed, add request entry
@@ -2636,9 +2664,9 @@ fn acknowledgement_and_statement_messages(
 	group_index: GroupIndex,
 	candidate_hash: CandidateHash,
 	local_knowledge: StatementFilter,
-) -> Vec<(Vec<PeerId>, net_protocol::VersionedValidationProtocol)> {
+) -> (Vec<(Vec<PeerId>, net_protocol::VersionedValidationProtocol)>, usize) {
 	let local_validator = match relay_parent_state.local_validator.as_mut() {
-		None => return Vec::new(),
+		None => return (Vec::new(), 0),
 		Some(l) => l,
 	};
 
@@ -2666,7 +2694,7 @@ fn acknowledgement_and_statement_messages(
 				"Bug ValidationVersion::V1 should not be used in statement-distribution v2,
 				legacy should have handled this"
 			);
-			return Vec::new()
+			return (Vec::new(), 0)
 		},
 	};
 
@@ -2687,10 +2715,11 @@ fn acknowledgement_and_statement_messages(
 		candidate_hash,
 		peer,
 	);
+	let statements_count = statement_messages.len();
 
 	messages.extend(statement_messages.into_iter().map(|m| (vec![peer.0], m)));
 
-	messages
+	(messages, statements_count)
 }
 
 #[overseer::contextbounds(StatementDistribution, prefix=self::overseer)]
@@ -2700,6 +2729,7 @@ async fn handle_incoming_acknowledgement<Context>(
 	peer: PeerId,
 	acknowledgement: net_protocol::v2::BackedCandidateAcknowledgement,
 	reputation: &mut ReputationAggregator,
+	metrics: &Metrics,
 ) {
 	// The key difference between acknowledgments and full manifests is that only
 	// the candidate hash is included alongside the bitfields, so the candidate
@@ -2780,10 +2810,12 @@ async fn handle_incoming_acknowledgement<Context>(
 	);
 
 	if !messages.is_empty() {
+		let count = messages.len();
 		ctx.send_message(NetworkBridgeTxMessage::SendValidationMessages(
 			messages.into_iter().map(|m| (vec![peer], m)).collect(),
 		))
 		.await;
+		metrics.on_statements_distributed(count);
 	}
 }
 
@@ -2793,6 +2825,7 @@ pub(crate) async fn handle_backed_candidate_message<Context>(
 	ctx: &mut Context,
 	state: &mut State,
 	candidate_hash: CandidateHash,
+	metrics: &Metrics,
 ) {
 	// If the candidate is unknown or unconfirmed, it's a race (pruned before receiving message)
 	// or a bug. Ignore if so
@@ -2834,6 +2867,7 @@ pub(crate) async fn handle_backed_candidate_message<Context>(
 		per_session,
 		&state.authorities,
 		&state.peers,
+		metrics,
 	)
 	.await;
 
@@ -2842,7 +2876,7 @@ pub(crate) async fn handle_backed_candidate_message<Context>(
 		ctx,
 		state,
 		confirmed.para_id(),
-		confirmed.candidate_receipt().descriptor().para_head,
+		confirmed.candidate_receipt().descriptor.para_head(),
 	)
 	.await;
 }
@@ -2855,6 +2889,7 @@ async fn send_cluster_candidate_statements<Context>(
 	state: &mut State,
 	candidate_hash: CandidateHash,
 	relay_parent: Hash,
+	metrics: &Metrics,
 ) {
 	let relay_parent_state = match state.per_relay_parent.get_mut(&relay_parent) {
 		None => return,
@@ -2897,6 +2932,7 @@ async fn send_cluster_candidate_statements<Context>(
 			&state.authorities,
 			&state.peers,
 			statement,
+			metrics,
 		)
 		.await;
 	}
@@ -2914,6 +2950,7 @@ async fn apply_post_confirmation<Context>(
 	state: &mut State,
 	post_confirmation: PostConfirmation,
 	reputation: &mut ReputationAggregator,
+	metrics: &Metrics,
 ) {
 	for peer in post_confirmation.reckoning.incorrect {
 		modify_reputation(reputation, ctx.sender(), peer, COST_INACCURATE_ADVERTISEMENT).await;
@@ -2927,6 +2964,7 @@ async fn apply_post_confirmation<Context>(
 		state,
 		candidate_hash,
 		post_confirmation.hypothetical.relay_parent(),
+		metrics,
 	)
 	.await;
 	new_confirmed_candidate_fragment_chain_updates(ctx, state, post_confirmation.hypothetical)
@@ -3052,14 +3090,16 @@ pub(crate) async fn handle_response<Context>(
 	state: &mut State,
 	response: UnhandledResponse,
 	reputation: &mut ReputationAggregator,
+	metrics: &Metrics,
 ) {
 	let &requests::CandidateIdentifier { relay_parent, candidate_hash, group_index } =
 		response.candidate_identifier();
+	let peer = *response.requested_peer();
 
 	gum::trace!(
 		target: LOG_TARGET,
 		?candidate_hash,
-		peer = ?response.requested_peer(),
+		?peer,
 		"Received response",
 	);
 
@@ -3094,6 +3134,8 @@ pub(crate) async fn handle_response<Context>(
 				expected_groups.iter().any(|g| g == &g_index)
 			},
 			disabled_mask,
+			&relay_parent_state.transposed_cq,
+			per_session.candidate_receipt_v2_enabled(),
 		);
 
 		for (peer, rep) in res.reputation_changes {
@@ -3151,7 +3193,7 @@ pub(crate) async fn handle_response<Context>(
 	};
 
 	// Note that this implicitly circulates all statements via the cluster.
-	apply_post_confirmation(ctx, state, post_confirmation, reputation).await;
+	apply_post_confirmation(ctx, state, post_confirmation, reputation, metrics).await;
 
 	let confirmed = state.candidates.get_confirmed(&candidate_hash).expect("just confirmed; qed");
 
